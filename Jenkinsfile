@@ -12,5 +12,14 @@ pipeline {
                 sh 'docker images | grep juice-shop'
             }
         }
+        stage('Deploy') {
+            steps {
+                sh 'minikube image load juice-shop:v1'
+                sh 'kubectl delete deployment juice-shop-k8s --ignore-not-found=true'
+                sh 'kunectl create deployment juice-shop-k8s --image=juice-shop:v1'
+                sh 'kubectl expose deployment juice-shop-k8s --type=NodePort --port=3000 || true'
+                sh 'kubectl get pods'
+            }
+        }
     }
 }
