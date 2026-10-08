@@ -12,6 +12,16 @@ pipeline {
                 sh 'docker images | grep juice-shop'
             }
         }
+        stage('Scan Code - Semgrep') {
+            steps {
+                sh 'docker run --rm -v "$PWD":/src semgrep/semgrep semgrep scan --config=auto --severity ERROR'
+            }
+        }
+        stage('Scan Image - Trivy') {
+            steps {
+                sh 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --severity HIGH,CRITICAL --no-progress juice-shop:v1'
+            }
+        }
         stage('Deploy') {
             steps {
                 sh 'minikube image load juice-shop:v1'
