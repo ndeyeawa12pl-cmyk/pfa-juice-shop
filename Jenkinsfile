@@ -28,8 +28,32 @@ pipeline {
                 sh 'kubectl delete deployment juice-shop-k8s --ignore-not-found=true'
                 sh 'kubectl create deployment juice-shop-k8s --image=juice-shop:v1'
                 sh 'kubectl expose deployment juice-shop-k8s --type=NodePort --port=3000 || true'
+                sh 'kubectl rollout status deployment/juice-shop-k8s --timeout=180s'
                 sh 'kubectl get pods'
             }
+        }
+        stage('Test dynamique - OWASP ZAP') {
+            steps {
+                sh '''
+                    NODEPORT=$(kubectl get svc juice-shop-k8s -o jsonpath='{.spec.ports[0].nodePort}')
+                    MINIKUBE_IP=$(minikube ip)
+                    mkdir -p reports && chmod 777 reports
+                    docker run --rm -v "$PWD/reports":/zap/wrk:rw zaproxy/zap-stable zap-baseline.py -t http://$MINIKUBE_IP:$NODEPORT -r zap-report.html || true
+                '''
+            }
+        }
+        stage('Scan Dependances - Dependency-Check') {
+            steps {
+                sh '''
+                    mkdir -p reports && chmod 777 reports
+                    docker run --rm -v "$PWD":/src -v "$PWD/reports":/report -v dc-data:/usr/share/dependency-check/data owasp/dependency-check:latest --scan /src --format HTML --out /report --disableNodeAudit --disableYarnAudit || true
+                '''
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
         }
     }
 }
