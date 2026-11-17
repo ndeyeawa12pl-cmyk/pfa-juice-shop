@@ -1,8 +1,18 @@
 pipeline {
     agent any
+    options {
+        disableConcurrentBuilds()
+    }
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+    parameters {
+        booleanParam(name: 'BLOQUER_SI_CRITIQUE', defaultValue: false, description: 'Arreter le pipeline si Trivy trouve une vulnerabilite CRITICAL')
+    }
     stages {
         stage('Build') {
             steps {
+                sh 'rm -rf reports'
                 sh 'docker pull bkimminich/juice-shop:latest'
                 sh 'docker tag bkimminich/juice-shop:latest juice-shop:v1'
             }
@@ -20,6 +30,11 @@ pipeline {
         stage('Scan Image - Trivy') {
             steps {
                 sh 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --severity HIGH,CRITICAL --no-progress juice-shop:v1'
+                script {
+                    if (params.BLOQUER_SI_CRITIQUE) {
+                        sh 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --severity CRITICAL --exit-code 1 --no-progress juice-shop:v1'
+                    }
+                }
             }
         }
         stage('Deploy') {
@@ -32,6 +47,18 @@ pipeline {
                 sh 'kubectl get pods'
             }
         }
+        stage('Test fonctionnel') {
+            steps {
+                sh '''
+                    sleep 15
+                    NODEPORT=$(kubectl get svc juice-shop-k8s -o jsonpath='{.spec.ports[0].nodePort}')
+                    MINIKUBE_IP=$(minikube ip)
+                    CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$MINIKUBE_IP:$NODEPORT)
+                    echo "Code HTTP recu : $CODE"
+                    test "$CODE" = "200"
+                '''
+            }
+        }
         stage('Test dynamique - OWASP ZAP') {
             steps {
                 sh '''
@@ -39,6 +66,7 @@ pipeline {
                     MINIKUBE_IP=$(minikube ip)
                     mkdir -p reports && chmod 777 reports
                     docker run --rm -v "$PWD/reports":/zap/wrk:rw zaproxy/zap-stable zap-baseline.py -t http://$MINIKUBE_IP:$NODEPORT -r zap-report.html || true
+                    test -f reports/zap-report.html
                 '''
             }
         }
@@ -47,6 +75,7 @@ pipeline {
                 sh '''
                     mkdir -p reports && chmod 777 reports
                     docker run --rm -v "$PWD":/src -v "$PWD/reports":/report -v dc-data:/usr/share/dependency-check/data owasp/dependency-check:latest --scan /src --format HTML --out /report --disableNodeAudit --disableYarnAudit || true
+                    test -f reports/dependency-check-report.html
                 '''
             }
         }
