@@ -1,223 +1,355 @@
-// ============================================================
-// PIPELINE CI/CD DEVSECOPS - Juice Shop
-// Correspondance avec le plan du professeur :
-//  2.1 Declenchement          : pollSCM (GitHub verifie toutes les 5 min)
-//  2.2 / 2.5 Construction     : etape "Construction de l image"
-//  2.3 Tests                  : etape "Tests fonctionnels"
-//  3.1 Semgrep (SAST)         : etape "SAST - Semgrep"
-//  3.2 Dependency-Check (SCA) : etape "SCA - Dependency-Check"
-//  3.3 Trivy (image)          : etape "Analyse de l image - Trivy"
-//  3.4 OWASP ZAP (DAST)       : etape "DAST - OWASP ZAP"
-//  3.5 Seuils                 : politique ci-dessous + deux Quality Gates
-//  2.6 Deploiement            : etape "Deploiement Kubernetes"
-//  4.3.5 Remontee resultats   : dossier reports archive + synthese.txt
-// ============================================================
-
-// ===== POLITIQUE DE SECURITE =====
-// Semgrep          : echec si une regle de gravite ERROR se declenche
-// Dependency-Check : echec si une faille a un score CVSS >= 9
-// Trivy            : echec si une faille CRITICAL avec correctif disponible
-// ZAP              : echec si au moins une alerte Moyenne ou Haute
-// Panne d'un outil : toujours un echec (rouge)
-
-def enregistrer(String outil, int rc, String rapport) {
-    if (!fileExists(rapport)) {
-        error("${outil} : rapport ${rapport} absent. L'outil est en panne, ce n'est pas une faille detectee.")
-    }
-    if (rc != 0) {
-        env.VIOLATIONS = (env.VIOLATIONS ?: '') + outil + ' '
-        echo "SEUIL DEPASSE : ${outil} (code ${rc})"
-    } else {
-        echo "${outil} : seuil respecte"
-    }
-}
-
-def decider(String mode, String etape) {
-    def v = env.VIOLATIONS ?: ''
-    if (v == '') {
-        echo "QUALITY GATE (${etape}) : OK, aucun seuil depasse"
-    } else if (mode == 'STRICT') {
-        error("QUALITY GATE (${etape}) : BLOQUE en mode STRICT. Seuils depasses : ${v}")
-    } else {
-        unstable("QUALITY GATE (${etape}) : seuils depasses (${v}) mais mode AUDIT, le pipeline continue")
-    }
-}
-
+// =====================================================================
+// Pipeline DevSecOps - OWASP Juice Shop (PFA)
+// Plan : Chapitre 3 section 2 (architecture du pipeline) et section 3
+// (positionnement des outils + seuils), Chapitre 4 sections 2 et 3.
+//
+// Philosophie :
+//   - Les scanners ne cassent JAMAIS le build : ils produisent des rapports.
+//   - Une seule etape DECIDE : le Security Gate (ci/security_gate.py).
+//   - Il bloque les NOUVELLES failles HIGH/CRITICAL (baseline + cliquet).
+//   - Pas de rapport complet = pas de deploiement.
+//
+// Hypotheses (a verifier sur ta machine) :
+//   - Pipeline lance en "Pipeline script from SCM" (checkout scm).
+//   - L'agent Jenkins est Linux (ou WSL) et l'utilisateur jenkins peut
+//     utiliser docker, semgrep, trivy, python3 (+ dependency-check,
+//     kubectl, minikube si ces options sont activees).
+//   - Le fichier ci/security_gate.py est dans le depot a cote du Jenkinsfile.
+// =====================================================================
 pipeline {
     agent any
+
     options {
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '15'))
         disableConcurrentBuilds()
-        buildDiscarder(logRotator(numToKeepStr: '20'))
-        timeout(time: 3, unit: 'HOURS')
     }
-    triggers {
-        pollSCM('H/5 * * * *')
-    }
+
     parameters {
-        choice(name: 'MODE', choices: ['AUDIT', 'STRICT'], description: 'AUDIT = on continue et le build devient orange. STRICT = on bloque si un seuil est depasse.')
-        choice(name: 'SOURCE_IMAGE', choices: ['SOURCES', 'OFFICIELLE'], description: 'SOURCES = construire l image avec le Dockerfile du depot (repli automatique sur l image officielle si ca echoue). OFFICIELLE = telecharger l image officielle.')
+        booleanParam(name: 'RESET_BASELINE', defaultValue: false,
+            description: 'Recree la baseline a partir de ce build (a cocher apres un gros nettoyage). Pas de deploiement.')
+        booleanParam(name: 'FAIL_ON_CRITICAL', defaultValue: false,
+            description: 'Jalon 1 : bloque aussi toute faille CRITICAL deja existante.')
+        booleanParam(name: 'RUN_DEPCHECK', defaultValue: true,
+            description: 'OWASP Dependency-Check (lent au premier lancement : base NVD a telecharger).')
+        booleanParam(name: 'DEPLOY', defaultValue: true,
+            description: 'Deployer sur Kubernetes (Minikube) si le Security Gate est valide.')
     }
+
     environment {
-        IMAGE = "juice-shop:build-${BUILD_NUMBER}"
+        IMAGE         = "pfa/juice-shop:${env.BUILD_NUMBER}"
+        REPORTS       = "${env.WORKSPACE}/security-reports"
+        NET           = "pfa-net-${env.BUILD_NUMBER}"
+        // Baseline conservee dans le volume Jenkins : elle survit entre les builds.
+        BASELINE_FILE = "${env.JENKINS_HOME}/security-baseline/baseline.json"
+        K8S_NAMESPACE = 'juice-shop'
     }
+
     stages {
-        stage('Preparation') {
+
+        // ---------------------------------------------------------------
+        // Ch.3 2.1 - Declenchement : recuperation du code
+        // ---------------------------------------------------------------
+        stage('1. Checkout') {
             steps {
-                script {
-                    env.MODE_EFFECTIF = params.MODE ?: 'AUDIT'
-                    env.SOURCE_EFFECTIVE = params.SOURCE_IMAGE ?: 'SOURCES'
-                    env.VIOLATIONS = ''
-                    env.ORIGINE_IMAGE = 'inconnue'
-                }
-                echo "Mode : ${env.MODE_EFFECTIF} | Source image : ${env.SOURCE_EFFECTIVE} | Image : ${env.IMAGE}"
-                sh 'rm -rf reports && mkdir -p reports && chmod 777 reports'
-                sh '''
-                    docker images --format "{{.Repository}}:{{.Tag}}" | grep "^juice-shop:build-" | grep -v ":build-${BUILD_NUMBER}$" | xargs -r docker rmi || true
-                    minikube image ls 2>/dev/null | grep "juice-shop:build-" | grep -v "build-${BUILD_NUMBER}$" | xargs -r -n1 minikube image rm || true
-                '''
+                checkout scm
+                sh 'rm -rf "$REPORTS" && mkdir -p "$REPORTS"'
             }
         }
-        stage('Construction de l image (plan 2.2 / 2.5)') {
+
+        // ---------------------------------------------------------------
+        // Verification des outils : echoue VITE avec un message clair
+        // au lieu d'un echec obscur au milieu du pipeline.
+        // ---------------------------------------------------------------
+        stage('2. Preflight (outils)') {
             steps {
                 script {
-                    if (env.SOURCE_EFFECTIVE == 'SOURCES') {
-                        def rc = sh(returnStatus: true, script: 'docker build -t "$IMAGE" .')
-                        if (rc == 0) {
-                            env.ORIGINE_IMAGE = 'sources du depot'
-                        } else {
-                            env.ORIGINE_IMAGE = 'officielle (repli apres echec du build)'
-                            unstable('Construction depuis les sources impossible : image officielle utilisee a la place')
-                        }
-                    } else {
-                        env.ORIGINE_IMAGE = 'officielle'
-                    }
-                    if (env.ORIGINE_IMAGE != 'sources du depot') {
+                    def tools = ['docker', 'python3', 'semgrep', 'trivy']
+                    if (params.RUN_DEPCHECK) { tools << 'dependency-check' }
+                    if (params.DEPLOY)       { tools += ['kubectl', 'minikube'] }
+                    withEnv(["TOOLS=${tools.join(' ')}"]) {
                         sh '''
-                            docker pull bkimminich/juice-shop:latest
-                            docker tag bkimminich/juice-shop:latest "$IMAGE"
+                            missing=""
+                            for t in $TOOLS; do
+                                command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+                            done
+                            if [ -n "$missing" ]; then
+                                echo "OUTILS MANQUANTS ou hors PATH pour l'utilisateur Jenkins :$missing"
+                                exit 1
+                            fi
+                            test -f ci/security_gate.py || { echo "ci/security_gate.py introuvable dans le depot"; exit 1; }
+                            docker version --format 'Docker serveur : {{.Server.Version}}'
+                            semgrep --version
+                            trivy --version | head -1
+                            python3 --version
                         '''
                     }
-                    sh 'docker inspect --format="{{.Id}}" "$IMAGE" > reports/image-id.txt'
-                    sh 'docker images "$IMAGE"'
-                    echo "Origine de l image : ${env.ORIGINE_IMAGE}"
                 }
             }
         }
-        stage('SAST - Semgrep (plan 3.1)') {
+
+        // ---------------------------------------------------------------
+        // Ch.3 2.2 / Ch.4 2.2 - Build de l'application (image Docker)
+        // Echec ici = vraie erreur de build : FAILURE legitime.
+        // ---------------------------------------------------------------
+        stage('3. Build image Docker') {
             steps {
-                script {
-                    def rc = sh(returnStatus: true, script: 'docker run --rm -v "$PWD":/src semgrep/semgrep semgrep scan --config=auto --severity ERROR --error --exclude=reports --json-output=reports/semgrep.json')
-                    if (rc > 1) {
-                        error("Semgrep en panne (code ${rc})")
-                    }
-                    enregistrer('Semgrep', rc, 'reports/semgrep.json')
-                }
+                sh 'docker build -t "$IMAGE" .'
             }
         }
-        stage('SCA - Dependency-Check (plan 3.2)') {
-            steps {
-                withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_KEY')]) {
-                    script {
-                        def rc = sh(returnStatus: true, script: '''
-                            docker run --rm -v "$PWD":/src -v "$PWD/reports":/report -v dc-data:/usr/share/dependency-check/data owasp/dependency-check:latest --scan /src --format HTML --format JSON --out /report --nvdApiKey "$NVD_KEY" --failOnCVSS 9 --exclude "**/reports/**" --exclude "**/.git/**" --disableNodeAudit --disableYarnAudit
-                        ''')
-                        enregistrer('Dependency-Check', rc, 'reports/dependency-check-report.json')
-                    }
-                }
-            }
-        }
-        stage('Analyse de l image - Trivy (plan 3.3)') {
-            steps {
-                script {
-                    sh 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/reports":/reports -v trivy-cache:/root/.cache/ aquasec/trivy:latest image --no-progress --format json --output /reports/trivy.json "$IMAGE"'
-                    def rc = sh(returnStatus: true, script: 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ aquasec/trivy:latest image --no-progress --severity CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE"')
-                    enregistrer('Trivy', rc, 'reports/trivy.json')
-                }
-            }
-        }
-        stage('Quality Gate 1 - avant deploiement (plan 3.5)') {
-            steps {
-                script {
-                    decider(env.MODE_EFFECTIF, 'avant deploiement')
-                }
-            }
-        }
-        stage('Deploiement Kubernetes (plan 2.6)') {
-            steps {
-                sh '''
-                    minikube image load "$IMAGE"
-                    minikube image ls | grep "juice-shop:build-${BUILD_NUMBER}" || { echo "Image absente de Minikube"; exit 1; }
-                    kubectl delete deployment juice-shop-k8s --ignore-not-found=true
-                    kubectl create deployment juice-shop-k8s --image="$IMAGE"
-                    kubectl expose deployment juice-shop-k8s --type=NodePort --port=3000 || true
-                '''
-                script {
-                    def rc = sh(returnStatus: true, script: 'kubectl rollout status deployment/juice-shop-k8s --timeout=300s')
-                    if (rc != 0) {
-                        sh 'kubectl get pods -o wide || true'
-                        sh 'kubectl describe pod -l app=juice-shop-k8s | tail -40 || true'
-                        sh 'kubectl logs -l app=juice-shop-k8s --tail=40 || true'
-                        error('Le deploiement Kubernetes ne devient pas pret (voir le diagnostic ci-dessus).')
+
+        // ---------------------------------------------------------------
+        // Ch.3 2.4 / 3.1-3.3 - Scans SAST, SCA et image, en parallele.
+        // Aucun de ces outils ne fait echouer le build sur une faille :
+        // ils ecrivent un rapport JSON. Si l'outil lui-meme plante,
+        // le build passe UNSTABLE (donc pas de deploiement).
+        // ---------------------------------------------------------------
+        stage('4. Scans de securite') {
+            parallel {
+
+                stage('Semgrep (SAST)') {
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            sh '''
+                                semgrep scan \
+                                    --config p/owasp-top-ten --config p/javascript \
+                                    --config p/typescript --config p/secrets \
+                                    --exclude node_modules --exclude frontend/dist \
+                                    --metrics=off --quiet \
+                                    --json --output "$REPORTS/semgrep.json" .
+                            '''
+                        }
                     }
                 }
-                sh 'kubectl get pods'
+
+                stage('Dependency-Check (SCA)') {
+                    when { expression { params.RUN_DEPCHECK } }
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            script {
+                                // Cle API NVD : Jenkins > Identifiants > "Secret text" avec l'ID nvd-api-key.
+                                // Sans cle, le telechargement de la base est tres lent et souvent limite.
+                                def hasKey = true
+                                try {
+                                    withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_KEY')]) {
+                                        echo 'Cle NVD trouvee.'
+                                    }
+                                } catch (ignored) {
+                                    hasKey = false
+                                    echo 'ATTENTION : identifiant nvd-api-key absent, Dependency-Check sera lent ou limite.'
+                                }
+                                def dc = '''
+                                    mkdir -p "$REPORTS/dc"
+                                    dependency-check --project JuiceShop --scan . \
+                                        --exclude "**/node_modules/**" --exclude "**/dist/**" \
+                                        --disableNodeAudit \
+                                        --format JSON --out "$REPORTS/dc" $NVD_ARG
+                                    cp "$REPORTS/dc/dependency-check-report.json" "$REPORTS/dependency-check.json"
+                                '''
+                                if (hasKey) {
+                                    withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_KEY')]) {
+                                        sh 'export NVD_ARG="--nvdApiKey $NVD_KEY"\n' + dc
+                                    }
+                                } else {
+                                    sh 'export NVD_ARG=""\n' + dc
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Trivy (image)') {
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            sh '''
+                                trivy image --scanners vuln \
+                                    --severity MEDIUM,HIGH,CRITICAL \
+                                    --timeout 20m --quiet \
+                                    --format json --output "$REPORTS/trivy.json" "$IMAGE"
+                            '''
+                        }
+                    }
+                }
             }
         }
-        stage('Tests fonctionnels (plan 2.3)') {
+
+        // ---------------------------------------------------------------
+        // Ch.3 2.6 / 3.4 - Staging ISOLE (reseau Docker dedie) + test
+        // fonctionnel de demarrage + scan dynamique OWASP ZAP.
+        // ---------------------------------------------------------------
+        stage('5. Staging, test fonctionnel et DAST (ZAP)') {
             steps {
-                sh '''
-                    NODEPORT=$(kubectl get svc juice-shop-k8s -o jsonpath='{.spec.ports[0].nodePort}')
-                    MINIKUBE_IP=$(minikube ip)
-                    URL=http://$MINIKUBE_IP:$NODEPORT
-                    CODE=000
-                    for i in $(seq 1 24); do
-                        CODE=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$URL/" || true)
-                        echo "Essai $i : code HTTP recu = $CODE"
-                        if [ "$CODE" = "200" ]; then
-                            break
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh '''
+                        docker network create "$NET"
+                        docker run -d --name "juice-staging-$BUILD_NUMBER" \
+                            --network "$NET" --network-alias juice "$IMAGE"
+
+                        # Test fonctionnel : l'application doit repondre (30 essais x 5 s)
+                        ok=0
+                        for i in $(seq 1 30); do
+                            if docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                                   -fsS http://juice:3000/rest/admin/application-version | grep -q version; then
+                                ok=1; echo "Application prete (essai $i)"; break
+                            fi
+                            echo "attente de l'application ($i/30)..."; sleep 5
+                        done
+                        if [ "$ok" -ne 1 ]; then
+                            echo "L'application n'a pas demarre. Derniers logs :"
+                            docker logs "juice-staging-$BUILD_NUMBER" 2>&1 | tail -50
+                            exit 1
                         fi
-                        sleep 5
-                    done
-                    CODE2=$(curl -s -o reports/search-response.json -m 10 -w "%{http_code}" "$URL/rest/products/search?q=apple" || true)
-                    CODE3=$(curl -s -o /dev/null -m 10 -w "%{http_code}" "$URL/metrics" || true)
-                    echo "accueil=$CODE recherche=$CODE2 metrics_informatif=$CODE3" | tee reports/tests-fonctionnels.txt
-                    test "$CODE" = "200"
-                    test "$CODE2" = "200"
-                    grep -q '"status":"success"' reports/search-response.json
-                '''
+
+                        # Scan dynamique ZAP (baseline). Le code de retour de ZAP depend
+                        # des alertes trouvees : c'est le gate qui decide, donc "|| true".
+                        docker run --name "zap-$BUILD_NUMBER" --network "$NET" \
+                            ghcr.io/zaproxy/zaproxy:stable \
+                            zap-baseline.py -t http://juice:3000 -J zap.json -m 3 -I || true
+                        docker cp "zap-$BUILD_NUMBER:/zap/wrk/zap.json" "$REPORTS/zap.json"
+                        test -s "$REPORTS/zap.json"
+                    '''
+                }
             }
         }
-        stage('DAST - OWASP ZAP (plan 3.4)') {
+
+        // ---------------------------------------------------------------
+        // Ch.5 3.1 - Point d'accroche du module IA (conditionnel).
+        // Le fichier security-reports/findings.json (alertes normalisees)
+        // est son jeu de donnees d'entree. Etape informative pour l'instant.
+        // ---------------------------------------------------------------
+        stage('6. Module IA (Chapitre 5)') {
+            when { expression { fileExists('ai_module/analyze.py') } }
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh 'python3 ai_module/analyze.py --findings "$REPORTS/findings.json" --out "$REPORTS/ai_analysis.json"'
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Ch.3 3.5 - SECURITY GATE : l'unique juge du pipeline.
+        // Code 0 = valide | 1 = nouvelles failles graves | 2 = rapports incomplets
+        // ---------------------------------------------------------------
+        stage('7. Security Gate') {
             steps {
                 script {
-                    def rc = sh(returnStatus: true, script: '''
-                        NODEPORT=$(kubectl get svc juice-shop-k8s -o jsonpath='{.spec.ports[0].nodePort}')
-                        MINIKUBE_IP=$(minikube ip)
-                        docker run --rm --network minikube -v "$PWD/reports":/zap/wrk:rw zaproxy/zap-stable zap-baseline.py -t http://$MINIKUBE_IP:$NODEPORT -r zap-report.html -J zap-report.json
-                    ''')
-                    echo "Code de retour ZAP = ${rc} (0 OK, 1 FAIL, 2 WARN, 3 erreur de l'outil)"
-                    if (rc == 3 || !fileExists('reports/zap-report.json')) {
-                        error('ZAP en panne : rapport absent ou erreur de l outil.')
+                    def required = ['semgrep', 'trivy', 'zap']
+                    if (params.RUN_DEPCHECK) { required << 'dependency-check' }
+                    def args = "--reports '${env.REPORTS}' --baseline '${env.BASELINE_FILE}' --require ${required.join(',')}"
+                    if (params.RESET_BASELINE)  { args += ' --reset-baseline' }
+                    if (params.FAIL_ON_CRITICAL) { args += ' --fail-on-critical' }
+
+                    def rc = sh(script: "python3 ci/security_gate.py ${args}", returnStatus: true)
+                    if (rc == 1) {
+                        error('SECURITY GATE : nouvelles failles HIGH/CRITICAL detectees. Voir le tableau ci-dessus.')
+                    } else if (rc != 0) {
+                        unstable('SECURITY GATE : rapports incomplets ou erreur du script. Aucun deploiement.')
                     }
-                    def moyen = sh(script: "grep -Eo '\"riskcode\" *: *\"?[23]\"?' reports/zap-report.json | wc -l", returnStdout: true).trim().toInteger()
-                    echo "Alertes ZAP de gravite Moyenne ou Haute : ${moyen}"
-                    enregistrer('ZAP', moyen > 0 ? 1 : 0, 'reports/zap-report.json')
                 }
             }
         }
-        stage('Quality Gate 2 - apres test dynamique (plan 3.5)') {
-            steps {
-                script {
-                    decider(env.MODE_EFFECTIF, 'apres test dynamique')
+
+        // ---------------------------------------------------------------
+        // Ch.3 2.6 / Ch.4 2.5 - Deploiement sur Kubernetes (Minikube),
+        // uniquement si TOUT est au vert (gate valide, aucun outil plante).
+        // Conteneur durci : non-root, aucune capacite Linux, pas d'escalade.
+        // ---------------------------------------------------------------
+        stage('8. Deploiement Kubernetes') {
+            when {
+                allOf {
+                    expression { params.DEPLOY }
+                    expression { !params.RESET_BASELINE }
+                    expression { currentBuild.currentResult == 'SUCCESS' }
                 }
+            }
+            steps {
+                sh 'minikube image load "$IMAGE"'
+                writeFile file: 'k8s-generated.yaml', text: """\
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${env.K8S_NAMESPACE}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: juice-shop
+  namespace: ${env.K8S_NAMESPACE}
+  labels:
+    app: juice-shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: juice-shop
+  template:
+    metadata:
+      labels:
+        app: juice-shop
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: juice-shop
+          image: ${env.IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /rest/admin/application-version
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juice-shop
+  namespace: ${env.K8S_NAMESPACE}
+spec:
+  type: NodePort
+  selector:
+    app: juice-shop
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30080
+"""
+                sh 'kubectl apply -f k8s-generated.yaml'
+                sh 'kubectl -n "$K8S_NAMESPACE" rollout status deployment/juice-shop --timeout=180s'
             }
         }
     }
+
     post {
         always {
-            sh 'mkdir -p reports'
-            writeFile file: 'reports/synthese.txt', text: "mode=${env.MODE_EFFECTIF}\nimage=${env.IMAGE}\norigine_image=${env.ORIGINE_IMAGE}\nbuild=${env.BUILD_NUMBER}\nseuils_depasses=${env.VIOLATIONS ?: 'aucun'}\n"
-            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+            // Nettoyage systematique : conteneurs et reseau de ce build uniquement.
+            sh '''
+                docker rm -f "juice-staging-$BUILD_NUMBER" "zap-$BUILD_NUMBER" >/dev/null 2>&1 || true
+                docker network rm "$NET" >/dev/null 2>&1 || true
+            '''
+            // Preuves pour le Chapitre 6 : rapports bruts, findings.json, summary.json.
+            archiveArtifacts artifacts: 'security-reports/*.json', allowEmptyArchive: true
         }
+        success { echo 'Pipeline termine : build SUCCESS.' }
+        unstable { echo 'Build UNSTABLE : un outil a plante ou un rapport manque. Pas de deploiement.' }
+        failure  { echo 'Build FAILURE : regarde le premier stage rouge, pas le dernier.' }
     }
 }
