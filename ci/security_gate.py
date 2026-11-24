@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 
 SEVERITIES = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
@@ -81,6 +82,11 @@ def parse_trivy(path):
     for i, result in enumerate(results):
         result = obj(result, f"Trivy.Results[{i}]")
         target = result.get("Target") or "image"
+        # La cible des paquets OS contient le tag de l'image (donc le numéro de
+        # build) : on la remplace par une valeur stable pour que l'empreinte
+        # d'une même faille reste identique d'un build à l'autre.
+        if result.get("Class") == "os-pkgs":
+            target = "os-packages:" + str(result.get("Type") or "os")
         vulns = array(result.get("Vulnerabilities") or [], f"Trivy.Results[{i}].Vulnerabilities")
         for j, vuln in enumerate(vulns):
             vuln = obj(vuln, f"Trivy vulnerability[{i}:{j}]")
@@ -274,6 +280,13 @@ def main():
     print(f"[GATE] total={len(findings)} nouvelles={len(new)} "
           f"nouvelles_bloquantes={len(new_blocking)} escalades={len(escalated)} "
           f"CRITICAL_presentes={len(critical)}")
+    if new:
+        by_tool = Counter((f["tool"], f["severity"]) for f in new)
+        print("[GATE] Nouvelles alertes par outil/gravité: " +
+              ", ".join(f"{t}/{sv}={n}" for (t, sv), n in sorted(by_tool.items())))
+    for f in (new_blocking + escalated)[:30]:
+        print(f"[GATE]   - [{f['severity']}] {f['tool']} {f['rule']} -> "
+              f"{f['location']} {f['package']}".rstrip())
     print(f"[GATE] DECISION: {summary['decision']}")
     return 1 if blocked else 0
 
