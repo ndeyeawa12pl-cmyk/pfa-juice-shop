@@ -208,10 +208,13 @@ pipeline {
 
                         # Scan dynamique ZAP (baseline). Le code de retour de ZAP depend
                         # des alertes trouvees : c'est le gate qui decide, donc "|| true".
-                        docker run --name "zap-$BUILD_NUMBER" --network "$NET" \
+                                                mkdir -p "$REPORTS/zap-wrk"
+                        chmod 777 "$REPORTS/zap-wrk"
+                        docker run --rm --name "zap-$BUILD_NUMBER" --network "$NET" \
+                            -v "$REPORTS/zap-wrk:/zap/wrk:rw" \
                             ghcr.io/zaproxy/zaproxy:stable \
                             zap-baseline.py -t http://juice:3000 -J zap.json -m 3 -I || true
-                        docker cp "zap-$BUILD_NUMBER:/zap/wrk/zap.json" "$REPORTS/zap.json"
+                        cp "$REPORTS/zap-wrk/zap.json" "$REPORTS/zap.json"
                         test -s "$REPORTS/zap.json"
                     '''
                 }
