@@ -66,7 +66,6 @@ pipeline {
             steps {
                 script {
                     def tools = ['docker', 'python3', 'semgrep', 'trivy']
-                    if (params.RUN_DEPCHECK) { tools << 'dependency-check' }
                     if (params.DEPLOY)       { tools += ['kubectl', 'minikube'] }
                     withEnv(["TOOLS=${tools.join(' ')}"]) {
                         sh '''
@@ -93,7 +92,7 @@ pipeline {
         // Ch.3 2.2 / Ch.4 2.2 - Build de l'application (image Docker)
         // Echec ici = vraie erreur de build : FAILURE legitime.
         // ---------------------------------------------------------------
-                stage('3. Build image Docker') {
+        stage('3. Build image Docker') {
             steps {
                 // L'application cible est recuperee en image officielle
                 // (evite la recompilation npm, sensible au reseau)
@@ -144,12 +143,20 @@ pipeline {
                                     hasKey = false
                                     echo 'ATTENTION : identifiant nvd-api-key absent, Dependency-Check sera lent ou limite.'
                                 }
+                                // Dependency-Check tourne dans Docker (image owasp/dependency-check)
+                                // avec le volume dc-data qui conserve la base NVD deja telechargee.
                                 def dc = '''
                                     mkdir -p "$REPORTS/dc"
-                                    dependency-check --project JuiceShop --scan . \
+                                    chmod 777 "$REPORTS/dc"
+                                    docker run --rm \
+                                        -v "$WORKSPACE:/src:ro" \
+                                        -v dc-data:/usr/share/dependency-check/data \
+                                        -v "$REPORTS/dc:/report:rw" \
+                                        owasp/dependency-check:latest \
+                                        --project JuiceShop --scan /src \
                                         --exclude "**/node_modules/**" --exclude "**/dist/**" \
                                         --disableNodeAudit \
-                                        --format JSON --out "$REPORTS/dc" $NVD_ARG
+                                        --format JSON --out /report $NVD_ARG
                                     cp "$REPORTS/dc/dependency-check-report.json" "$REPORTS/dependency-check.json"
                                 '''
                                 if (hasKey) {
@@ -208,7 +215,7 @@ pipeline {
 
                         # Scan dynamique ZAP (baseline). Le code de retour de ZAP depend
                         # des alertes trouvees : c'est le gate qui decide, donc "|| true".
-                                                mkdir -p "$REPORTS/zap-wrk"
+                        mkdir -p "$REPORTS/zap-wrk"
                         chmod 777 "$REPORTS/zap-wrk"
                         docker run --rm --name "zap-$BUILD_NUMBER" --network "$NET" \
                             -v "$REPORTS/zap-wrk:/zap/wrk:rw" \
