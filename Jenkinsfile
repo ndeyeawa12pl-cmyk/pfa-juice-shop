@@ -93,9 +93,14 @@ pipeline {
         // Ch.3 2.2 / Ch.4 2.2 - Build de l'application (image Docker)
         // Echec ici = vraie erreur de build : FAILURE legitime.
         // ---------------------------------------------------------------
-        stage('3. Build image Docker') {
+                stage('3. Build image Docker') {
             steps {
-                sh 'docker build -t "$IMAGE" .'
+                // L'application cible est recuperee en image officielle
+                // (evite la recompilation npm, sensible au reseau)
+                sh '''
+                    docker pull bkimminich/juice-shop:latest
+                    docker tag bkimminich/juice-shop:latest "$IMAGE"
+                '''
             }
         }
 
