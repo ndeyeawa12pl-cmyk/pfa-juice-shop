@@ -165,8 +165,9 @@ def main():
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--require", default="semgrep,trivy,zap,dependency-check")
     ap.add_argument("--reset-baseline", action="store_true")
-    # Ancien argument accepté pour compatibilité; les CRITICAL bloquent désormais toujours.
-    ap.add_argument("--fail-on-critical", action="store_true", help=argparse.SUPPRESS)
+    # Jalon "zéro CRITICAL" : bloque aussi les CRITICAL déjà présentes.
+    ap.add_argument("--fail-on-critical", action="store_true",
+                    help="bloquer aussi toute faille CRITICAL existante")
     args = ap.parse_args()
 
     required = [x.strip() for x in args.require.split(",") if x.strip()]
@@ -216,7 +217,7 @@ def main():
     critical = [f for f in findings if f["severity"] == "CRITICAL"]
 
     if args.reset_baseline:
-        if critical:
+        if critical and args.fail_on_critical:
             summary["decision"] = "BASELINE_REJECTED_CRITICAL_PRESENT"
             write_json(os.path.join(args.reports, "summary.json"), summary)
             print("[GATE] BLOCK: baseline refusée, des CRITICAL sont présentes.")
@@ -257,7 +258,8 @@ def main():
                 escalated.append(finding)
 
     new_blocking = [f for f in new if f["severity"] in BLOCKING_NEW]
-    blocked = bool(new_blocking or escalated or critical)
+    critical_blocking = critical if args.fail_on_critical else []
+    blocked = bool(new_blocking or escalated or critical_blocking)
     summary.update({
         "baseline_total": len(baseline),
         "new_findings": len(new),
