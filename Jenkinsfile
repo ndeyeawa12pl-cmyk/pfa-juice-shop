@@ -148,6 +148,9 @@ pipeline {
                                 def dc = '''
                                     mkdir -p "$REPORTS/dc"
                                     chmod 777 "$REPORTS/dc"
+                                    # Code 14 = des archives pieges de Juice Shop n'ont pas pu etre lues
+                                    # (zip chiffre, zip-slip). Le rapport est quand meme ecrit :
+                                    # on tolere ce code et on verifie que le rapport existe.
                                     docker run --rm \
                                         -v "$WORKSPACE:/src:ro" \
                                         -v dc-data:/usr/share/dependency-check/data \
@@ -156,7 +159,8 @@ pipeline {
                                         --project JuiceShop --scan /src \
                                         --exclude "**/node_modules/**" --exclude "**/dist/**" \
                                         --disableNodeAudit \
-                                        --format JSON --out /report $NVD_ARG
+                                        --format JSON --out /report $NVD_ARG || echo "dependency-check a termine avec un code non nul (voir ci-dessus)"
+                                    test -s "$REPORTS/dc/dependency-check-report.json"
                                     cp "$REPORTS/dc/dependency-check-report.json" "$REPORTS/dependency-check.json"
                                 '''
                                 if (hasKey) {
