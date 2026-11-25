@@ -66,7 +66,7 @@ pipeline {
             steps {
                 script {
                     def tools = ['docker', 'python3', 'semgrep', 'trivy']
-                    if (params.DEPLOY)       { tools += ['kubectl', 'minikube'] }
+                    if (params.DEPLOY)       { tools << 'kubectl' }
                     withEnv(["TOOLS=${tools.join(' ')}"]) {
                         sh '''
                             missing=""
@@ -283,7 +283,18 @@ pipeline {
                 }
             }
             steps {
-                sh 'minikube image load "$IMAGE"'
+                // Chargement de l'image dans Minikube SANS la commande minikube
+                // (elle exige l'acces au dossier personnel de l'utilisateur pfa).
+                // Minikube (driver Docker) tourne dans le conteneur "minikube".
+                sh '''
+                    if docker exec minikube docker version >/dev/null 2>&1; then
+                        echo "Runtime Minikube : docker"
+                        docker save "$IMAGE" | docker exec -i minikube docker load
+                    else
+                        echo "Runtime Minikube : containerd"
+                        docker save "$IMAGE" | docker exec -i minikube ctr -n k8s.io images import -
+                    fi
+                '''
                 writeFile file: 'k8s-generated.yaml', text: """\
 apiVersion: v1
 kind: Namespace
