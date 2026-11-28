@@ -99,7 +99,7 @@ pipeline {
 
                             if [ "$DEPLOY" = "true" ]; then
                                 kubectl get nodes
-                                docker exec minikube sh -c 'command -v ctr >/dev/null 2>&1 || command -v docker >/dev/null 2>&1'
+                                docker exec minikube ctr version
                             fi
                         '''
                     }
@@ -377,13 +377,9 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    if docker exec minikube docker version >/dev/null 2>&1; then
-                        echo "Runtime Minikube : Docker"
-                        docker save "$IMAGE" | docker exec -i minikube docker load
-                    else
-                        echo "Runtime Minikube : containerd"
-                        docker save "$IMAGE" | docker exec -i minikube ctr -n k8s.io images import -
-                    fi
+                    echo "Runtime Minikube confirmé : containerd"
+                    docker save "$IMAGE" | docker exec -i minikube ctr -n k8s.io images import -
+                    docker exec minikube ctr -n k8s.io images list | grep -F "$IMAGE"
                 '''
 
                 writeFile file: 'k8s-generated.yaml', text: '''
